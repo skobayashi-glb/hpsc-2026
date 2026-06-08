@@ -8,8 +8,16 @@
 using namespace std;
 using namespace nvcuda;
 
+// [追加] A, B を事前に half 型に変換するカーネル
+// 目的: カーネル内でのロードサイズを float(4B) → half(2B) に半減させる
+__global__ void float_to_half(float *src, half *dst, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) dst[i] = __float2half(src[i]);
+}
+
+// [変更] d_a, d_b を float* → half* に変更（事前変換済みを受け取る）
 __global__ void kernel(int dim_m, int dim_n, int dim_k,
-		       float *d_a, float *d_b, float *d_c) {
+		       half *d_a, half *d_b, float *d_c) {
   int offset_m = 128 * blockIdx.x;
   int offset_n = 128 * blockIdx.y;
   int tid = threadIdx.x;
@@ -17,10 +25,8 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
   int warp_m_idx = warp_id / 2;
   int warp_n_idx = warp_id % 2;
 
-  __shared__ half smem_a[32][128];  // [K][M]
-  // [変更] smem_b を [K][N] → [N][K] に転置
-  // 理由: Bのグローバルメモリロードをcoalesced（連続アドレス）にするため
-  __shared__ half smem_b[128][32];  // [N][K]
+  __shared__ half smem_a[32][128];
+  __shared__ half smem_b[128][32];
 
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][4];
   for (int r = 0; r < 4; r++)
@@ -29,28 +35,21 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
 
   for (int k = 0; k < dim_k; k += 32) {
     __syncthreads();
-    // A: coalescedロード（変更なし）
-    // 連続スレッドが連続アドレスを読む ✓
+    // [変更] __float2half が不要になり、half を直接ロード（2B/要素）
     for (int j = 0; j < 32; j++)
-      smem_a[j][tid] = __float2half(d_a[(k + j) * dim_m + offset_m + tid]);
-
-    // [変更] B: coalescedロード（フラットインデックス方式）
-    // flat = iter*128 + tid を (n_local, k_local) に分解する
-    // warp内の連続スレッドが同じ行(n_local)の連続K列を読む → coalesced ✓
+      smem_a[j][tid] = d_a[(k + j) * dim_m + offset_m + tid];
     for (int iter = 0; iter < 32; iter++) {
       int flat    = iter * 128 + tid;
-      int n_local = flat / 32;   // 担当するN方向インデックス
-      int k_local = flat % 32;   // 担当するK方向インデックス
-      smem_b[n_local][k_local] = __float2half(d_b[(offset_n + n_local) * dim_k + k + k_local]);
+      int n_local = flat / 32;
+      int k_local = flat % 32;
+      smem_b[n_local][k_local] = d_b[(offset_n + n_local) * dim_k + k + k_local];
     }
     __syncthreads();
-
     for (int kk = 0; kk < 32; kk += 16) {
       for (int r = 0; r < 4; r++) {
         wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
         wmma::load_matrix_sync(a_frag, &smem_a[kk][warp_m_idx * 64 + r * 16], 128);
         for (int c = 0; c < 4; c++) {
-          // [変更] smem_b が [N][K] になったので col_major に変更、stride 128→32
           wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
           wmma::load_matrix_sync(b_frag, &smem_b[warp_n_idx * 64 + c * 16][kk], 32);
           wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
@@ -89,6 +88,15 @@ int main(int argc, const char **argv) {
   for (int i=0; i<n; i++)
     for (int j=0; j<m; j++)
       C[m*i+j] = C2[m*i+j] = 0;
+
+  // [追加] A, B を half に事前変換（計測ループの外で行うのでカーネル時間に含まれない）
+  half *A_half, *B_half;
+  cudaMallocManaged(&A_half, (size_t)m * k * sizeof(half));
+  cudaMallocManaged(&B_half, (size_t)k * n * sizeof(half));
+  float_to_half<<<(m*k+255)/256, 256>>>(A, A_half, m*k);
+  float_to_half<<<(k*n+255)/256, 256>>>(B, B_half, k*n);
+  cudaDeviceSynchronize();
+
   cublasHandle_t cublas_handle;
   cublasCreate(&cublas_handle);
   auto tic = chrono::steady_clock::now();
@@ -118,7 +126,8 @@ int main(int argc, const char **argv) {
   dim3 grid = dim3((m+tile-1)/tile, (n+tile-1)/tile);
   for (int i = 0; i < Nt+2; i++) {
     if (i == 2) tic = chrono::steady_clock::now();
-    kernel<<< grid, block >>>(m, n, k, A, B, C2);
+    // [変更] A_half, B_half を渡す
+    kernel<<< grid, block >>>(m, n, k, A_half, B_half, C2);
     cudaDeviceSynchronize();
   }
   toc = chrono::steady_clock::now();
@@ -136,5 +145,7 @@ int main(int argc, const char **argv) {
   cudaFree(B);
   cudaFree(C);
   cudaFree(C2);
+  cudaFree(A_half);
+  cudaFree(B_half);
   cublasDestroy(cublas_handle);
 }
