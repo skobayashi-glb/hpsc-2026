@@ -10,42 +10,56 @@ using namespace nvcuda;
 
 __global__ void kernel(int dim_m, int dim_n, int dim_k,
 		       float *d_a, float *d_b, float *d_c) {
-  int offset_a_m = 64 * blockIdx.x;
-  int offset_b_n = 64 * blockIdx.y;
-  int i = threadIdx.x;
+  // [変更] タイルサイズを 64→128 に拡大
+  int offset_m = 128 * blockIdx.x;
+  int offset_n = 128 * blockIdx.y;
+  int tid = threadIdx.x;
   int warp_id = threadIdx.x / 32;
+  // [変更] warp を 2×2 に配置（元は 2×1）
+  int warp_m_idx = warp_id / 2;  // 0 or 1：M方向のwarp位置
+  int warp_n_idx = warp_id % 2;  // 0 or 1：N方向のwarp位置
 
-  __shared__ half block_a[16][64];
-  __shared__ half block_b[16][64];
+  // [変更] shared memory を [16][64] → [32][128] に拡大
+  __shared__ half smem_a[32][128];
+  __shared__ half smem_b[32][128];
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
-  for (int r = 0; r < 2; r++)
+  // [変更] accumulator を [2][4] → [4][4] に拡大（1 warp で 4×4 fragment 担当）
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][4];
+  for (int r = 0; r < 4; r++)
     for (int c = 0; c < 4; c++)
       wmma::fill_fragment(acc[r][c], 0.0f);
 
-  for (int k = 0; k < dim_k; k += 16) {
+  // [変更] K方向のステップを 16→32 に拡大
+  for (int k = 0; k < dim_k; k += 32) {
     __syncthreads();
-    for (int j = 0; j < 16; ++j) {
-      block_a[j][i] = __float2half(d_a[(k + j) * dim_m + offset_a_m + i]);
-      block_b[j][i] = __float2half(d_b[(offset_b_n + i) * dim_k + k + j]);
+    // A, B の 32×128 タイルを shared memory に読み込む
+    // 128スレッドで tid が列方向を担当
+    for (int j = 0; j < 32; j++) {
+      smem_a[j][tid] = __float2half(d_a[(k + j) * dim_m + offset_m + tid]);
+      smem_b[j][tid] = __float2half(d_b[(offset_n + tid) * dim_k + k + j]);
     }
     __syncthreads();
-    for (int r = 0; r < 2; r++) {
-      int row_tile = warp_id * 2 + r;
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-      wmma::load_matrix_sync(a_frag, &block_a[0][row_tile * 16], 64);
-      for (int c = 0; c < 4; c++) {
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-        wmma::load_matrix_sync(b_frag, &block_b[0][c * 16], 64);
-        wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
+    // [変更] TILE_K=32 を 16 ずつ 2 回に分けて WMMA 演算
+    for (int kk = 0; kk < 32; kk += 16) {
+      for (int r = 0; r < 4; r++) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
+        // [変更] stride を 64→128、warp の M オフセットを warp_m_idx*64 に変更
+        wmma::load_matrix_sync(a_frag, &smem_a[kk][warp_m_idx * 64 + r * 16], 128);
+        for (int c = 0; c < 4; c++) {
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+          // [変更] stride を 64→128、warp の N オフセットを warp_n_idx*64 に変更
+          wmma::load_matrix_sync(b_frag, &smem_b[kk][warp_n_idx * 64 + c * 16], 128);
+          wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
+        }
       }
     }
   }
-  for (int r = 0; r < 2; r++) {
+  // [変更] 出力タイルも warp_m_idx / warp_n_idx でオフセットして書き戻し
+  for (int r = 0; r < 4; r++) {
     for (int c = 0; c < 4; c++) {
-      int c_m = offset_a_m + (warp_id * 2 + r) * 16;
-      int c_n = offset_b_n + c * 16;
-      if (c_n < dim_n && c_m < dim_m)
+      int c_m = offset_m + warp_m_idx * 64 + r * 16;
+      int c_n = offset_n + warp_n_idx * 64 + c * 16;
+      if (c_m < dim_m && c_n < dim_n)
         wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c], dim_m, wmma::mem_col_major);
     }
   }
@@ -96,17 +110,13 @@ int main(int argc, const char **argv) {
   int64_t num_flops = (2 * int64_t(m) * int64_t(n) * int64_t(k)) + (2 * int64_t(m) * int64_t(n));
   double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
-  int tile = 64;
-  dim3 block = dim3(tile);
+  // [変更] block を 64→128 スレッド、grid をタイルサイズ 128 に合わせて変更
+  int tile = 128;
+  dim3 block = dim3(128);
   dim3 grid = dim3((m+tile-1)/tile, (n+tile-1)/tile);
   for (int i = 0; i < Nt+2; i++) {
     if (i == 2) tic = chrono::steady_clock::now();
-    kernel<<< grid, block >>>(m,
-			      n,
-			      k,
-			      A,
-			      B,
-			      C2);
+    kernel<<< grid, block >>>(m, n, k, A, B, C2);
     cudaDeviceSynchronize();
   }
   toc = chrono::steady_clock::now();
