@@ -10,51 +10,54 @@ using namespace nvcuda;
 
 __global__ void kernel(int dim_m, int dim_n, int dim_k,
 		       float *d_a, float *d_b, float *d_c) {
-  // [変更] タイルサイズを 64→128 に拡大
   int offset_m = 128 * blockIdx.x;
   int offset_n = 128 * blockIdx.y;
   int tid = threadIdx.x;
   int warp_id = threadIdx.x / 32;
-  // [変更] warp を 2×2 に配置（元は 2×1）
-  int warp_m_idx = warp_id / 2;  // 0 or 1：M方向のwarp位置
-  int warp_n_idx = warp_id % 2;  // 0 or 1：N方向のwarp位置
+  int warp_m_idx = warp_id / 2;
+  int warp_n_idx = warp_id % 2;
 
-  // [変更] shared memory を [16][64] → [32][128] に拡大
-  __shared__ half smem_a[32][128];
-  __shared__ half smem_b[32][128];
+  __shared__ half smem_a[32][128];  // [K][M]
+  // [変更] smem_b を [K][N] → [N][K] に転置
+  // 理由: Bのグローバルメモリロードをcoalesced（連続アドレス）にするため
+  __shared__ half smem_b[128][32];  // [N][K]
 
-  // [変更] accumulator を [2][4] → [4][4] に拡大（1 warp で 4×4 fragment 担当）
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][4];
   for (int r = 0; r < 4; r++)
     for (int c = 0; c < 4; c++)
       wmma::fill_fragment(acc[r][c], 0.0f);
 
-  // [変更] K方向のステップを 16→32 に拡大
   for (int k = 0; k < dim_k; k += 32) {
     __syncthreads();
-    // A, B の 32×128 タイルを shared memory に読み込む
-    // 128スレッドで tid が列方向を担当
-    for (int j = 0; j < 32; j++) {
+    // A: coalescedロード（変更なし）
+    // 連続スレッドが連続アドレスを読む ✓
+    for (int j = 0; j < 32; j++)
       smem_a[j][tid] = __float2half(d_a[(k + j) * dim_m + offset_m + tid]);
-      smem_b[j][tid] = __float2half(d_b[(offset_n + tid) * dim_k + k + j]);
+
+    // [変更] B: coalescedロード（フラットインデックス方式）
+    // flat = iter*128 + tid を (n_local, k_local) に分解する
+    // warp内の連続スレッドが同じ行(n_local)の連続K列を読む → coalesced ✓
+    for (int iter = 0; iter < 32; iter++) {
+      int flat    = iter * 128 + tid;
+      int n_local = flat / 32;   // 担当するN方向インデックス
+      int k_local = flat % 32;   // 担当するK方向インデックス
+      smem_b[n_local][k_local] = __float2half(d_b[(offset_n + n_local) * dim_k + k + k_local]);
     }
     __syncthreads();
-    // [変更] TILE_K=32 を 16 ずつ 2 回に分けて WMMA 演算
+
     for (int kk = 0; kk < 32; kk += 16) {
       for (int r = 0; r < 4; r++) {
         wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-        // [変更] stride を 64→128、warp の M オフセットを warp_m_idx*64 に変更
         wmma::load_matrix_sync(a_frag, &smem_a[kk][warp_m_idx * 64 + r * 16], 128);
         for (int c = 0; c < 4; c++) {
-          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
-          // [変更] stride を 64→128、warp の N オフセットを warp_n_idx*64 に変更
-          wmma::load_matrix_sync(b_frag, &smem_b[kk][warp_n_idx * 64 + c * 16], 128);
+          // [変更] smem_b が [N][K] になったので col_major に変更、stride 128→32
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+          wmma::load_matrix_sync(b_frag, &smem_b[warp_n_idx * 64 + c * 16][kk], 32);
           wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
         }
       }
     }
   }
-  // [変更] 出力タイルも warp_m_idx / warp_n_idx でオフセットして書き戻し
   for (int r = 0; r < 4; r++) {
     for (int c = 0; c < 4; c++) {
       int c_m = offset_m + warp_m_idx * 64 + r * 16;
@@ -110,7 +113,6 @@ int main(int argc, const char **argv) {
   int64_t num_flops = (2 * int64_t(m) * int64_t(n) * int64_t(k)) + (2 * int64_t(m) * int64_t(n));
   double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
-  // [変更] block を 64→128 スレッド、grid をタイルサイズ 128 に合わせて変更
   int tile = 128;
   dim3 block = dim3(128);
   dim3 grid = dim3((m+tile-1)/tile, (n+tile-1)/tile);
