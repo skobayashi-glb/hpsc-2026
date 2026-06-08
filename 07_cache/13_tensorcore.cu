@@ -36,7 +36,7 @@ __global__ void float_to_half(const float *__restrict__ src,
   if (i < n) dst[i] = __float2half(src[i]);
 }
 
-__global__ __launch_bounds__(256, 1)
+__global__ __launch_bounds__(512, 1)
 void kernel(int dim_m, int dim_n, int dim_k,
             const half *__restrict__ d_a,
             const half *__restrict__ d_b,
@@ -44,7 +44,9 @@ void kernel(int dim_m, int dim_n, int dim_k,
   constexpr int BM = 128;
   constexpr int BN = 256;
   constexpr int BK = 32;
-  constexpr int WM = 64;
+  constexpr int BM_PAD = 136;
+  constexpr int BK_PAD = 40;
+  constexpr int WM = 32;
   constexpr int WN = 64;
 
   int tid = threadIdx.x;
@@ -55,76 +57,53 @@ void kernel(int dim_m, int dim_n, int dim_k,
   int base_n = blockIdx.y * BN;
 
   // C の 1 block あたりの担当範囲を 128x256 に拡大。
-  // 8 warp で 2x4 個の 64x64 warp tile を計算し、A tile を N 方向に再利用する。
-  __shared__ half smem_a[2][BK][BM];
-  __shared__ half smem_b[2][BN][BK];
+  // [変更] 16 warp で 4x4 個の 32x64 warp tile を計算する。
+  // 1 warp が持つ accumulator を 16 個から 8 個に減らし、レジスタ圧迫を下げる。
+  // [変更] 通常ロードでは double buffer が十分に重ならないため、単一バッファに戻して
+  // shared memory に padding を入れる。WMMA load の bank conflict を減らす狙い。
+  __shared__ __align__(16) half smem_a[BK][BM_PAD];
+  __shared__ __align__(16) half smem_b[BN][BK_PAD];
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][4];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
 #pragma unroll
-  for (int r = 0; r < 4; ++r) {
+  for (int r = 0; r < 2; ++r) {
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
       wmma::fill_fragment(acc[r][c], 0.0f);
     }
   }
 
-  // A/B は計測前に half 化済みなので、カーネル内の float->half 変換をなくす。
-  // shared memory をダブルバッファ化し、次の K tile を別バッファに先読みする。
-  // 端の block で余った要素は 0 を入れ、入力範囲外を読まないようにする。
-  for (int idx = tid; idx < BK * BM; idx += blockDim.x) {
-    int kk = idx / BM;
-    int mm = idx - kk * BM;
-    int gm = base_m + mm;
-    smem_a[0][kk][mm] =
-        (gm < dim_m && kk < dim_k) ? d_a[kk * dim_m + gm] : __float2half(0.0f);
-  }
-  for (int idx = tid; idx < BN * BK; idx += blockDim.x) {
-    int nn = idx / BK;
-    int kk = idx - nn * BK;
-    int gn = base_n + nn;
-    smem_b[0][nn][kk] =
-        (gn < dim_n && kk < dim_k) ? d_b[gn * dim_k + kk] : __float2half(0.0f);
-  }
-  __syncthreads();
-
   for (int k0 = 0; k0 < dim_k; k0 += BK) {
-    int cur = (k0 / BK) & 1;
-    int nxt = cur ^ 1;
-    int next_k = k0 + BK;
-
-    if (next_k < dim_k) {
-      for (int idx = tid; idx < BK * BM; idx += blockDim.x) {
-        int kk = idx / BM;
-        int mm = idx - kk * BM;
-        int gm = base_m + mm;
-        int gk = next_k + kk;
-        smem_a[nxt][kk][mm] =
-            (gm < dim_m && gk < dim_k)
-                ? d_a[gk * dim_m + gm]
-                : __float2half(0.0f);
-      }
-      for (int idx = tid; idx < BN * BK; idx += blockDim.x) {
-        int nn = idx / BK;
-        int kk = idx - nn * BK;
-        int gn = base_n + nn;
-        int gk = next_k + kk;
-        smem_b[nxt][nn][kk] =
-            (gn < dim_n && gk < dim_k)
-                ? d_b[gn * dim_k + gk]
-                : __float2half(0.0f);
-      }
+    // A/B は計測前に half 化済みなので、カーネル内の float->half 変換をなくす。
+    // 端の block で余った要素は 0 を入れ、入力範囲外を読まないようにする。
+    for (int idx = tid; idx < BK * BM; idx += blockDim.x) {
+      int kk = idx / BM;
+      int mm = idx - kk * BM;
+      int gm = base_m + mm;
+      int gk = k0 + kk;
+      smem_a[kk][mm] =
+          (gm < dim_m && gk < dim_k) ? d_a[gk * dim_m + gm] : __float2half(0.0f);
     }
+    for (int idx = tid; idx < BN * BK; idx += blockDim.x) {
+      int nn = idx / BK;
+      int kk = idx - nn * BK;
+      int gn = base_n + nn;
+      int gk = k0 + kk;
+      smem_b[nn][kk] =
+          (gn < dim_n && gk < dim_k) ? d_b[gn * dim_k + gk] : __float2half(0.0f);
+    }
+    __syncthreads();
 
     // WMMA の固定回数ループを unroll し、Tensor Core 命令の制御オーバーヘッドを下げる。
 #pragma unroll
     for (int kk = 0; kk < BK; kk += 16) {
 #pragma unroll
-      for (int r = 0; r < 4; ++r) {
+      for (int r = 0; r < 2; ++r) {
         wmma::fragment<wmma::matrix_a, 16, 16, 16, half,
                        wmma::col_major>
             a_frag;
         int a_m = warp_m * WM + r * 16;
-        wmma::load_matrix_sync(a_frag, &smem_a[cur][kk][a_m], BM);
+        wmma::load_matrix_sync(a_frag, &smem_a[kk][a_m], BM_PAD);
 
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
@@ -132,7 +111,7 @@ void kernel(int dim_m, int dim_n, int dim_k,
                          wmma::col_major>
               b_frag;
           int b_n = warp_n * WN + c * 16;
-          wmma::load_matrix_sync(b_frag, &smem_b[cur][b_n][kk], BK);
+          wmma::load_matrix_sync(b_frag, &smem_b[b_n][kk], BK_PAD);
           wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
         }
       }
@@ -141,7 +120,7 @@ void kernel(int dim_m, int dim_n, int dim_k,
   }
 
 #pragma unroll
-  for (int r = 0; r < 4; ++r) {
+  for (int r = 0; r < 2; ++r) {
 #pragma unroll
     for (int c = 0; c < 4; ++c) {
       int c_m = base_m + warp_m * WM + r * 16;
@@ -251,7 +230,7 @@ int main(int argc, const char **argv) {
   double tcublas = double(cublas_ms) / 1000.0 / Nt;
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
 
-  dim3 block(256);
+  dim3 block(512);
   dim3 grid((m + 127) / 128, (n + 255) / 256);
   // chrono ではなく CUDA Event で、GPU 上のカーネル実行時間だけを測る。
   for (int i = 0; i < 2; i++) {
