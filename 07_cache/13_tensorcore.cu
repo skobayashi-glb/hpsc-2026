@@ -25,37 +25,62 @@ __global__ void kernel(int dim_m, int dim_n, int dim_k,
   int warp_m_idx = warp_id / 2;
   int warp_n_idx = warp_id % 2;
 
-  __shared__ half smem_a[32][128];
-  __shared__ half smem_b[128][32];
+  // [案1] ダブルバッファ: cur(計算用) と nxt(ロード用) の 2 組を用意
+  // [案2] K_step を 32→64 に拡大（sync 回数を 128→64 に半減）
+  // ロードと演算は別バッファへのアクセスなので GPU 内部で並行実行される
+  __shared__ half smem_a[2][64][128];  // [buf][K_step][M]
+  __shared__ half smem_b[2][128][64];  // [buf][N][K_step]
 
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][4];
   for (int r = 0; r < 4; r++)
     for (int c = 0; c < 4; c++)
       wmma::fill_fragment(acc[r][c], 0.0f);
 
-  for (int k = 0; k < dim_k; k += 32) {
-    __syncthreads();
-    // [変更] __float2half が不要になり、half を直接ロード（2B/要素）
-    for (int j = 0; j < 32; j++)
-      smem_a[j][tid] = d_a[(k + j) * dim_m + offset_m + tid];
-    for (int iter = 0; iter < 32; iter++) {
-      int flat    = iter * 128 + tid;
-      int n_local = flat / 32;
-      int k_local = flat % 32;
-      smem_b[n_local][k_local] = d_b[(offset_n + n_local) * dim_k + k + k_local];
+  // [案1] メインループの前に最初のタイル（k=0〜63）を buf[0] にプリロード
+  for (int j = 0; j < 64; j++)
+    smem_a[0][j][tid] = d_a[j * dim_m + offset_m + tid];
+  for (int iter = 0; iter < 64; iter++) {
+    int flat    = iter * 128 + tid;
+    int n_local = flat / 64;
+    int k_local = flat % 64;
+    smem_b[0][n_local][k_local] = d_b[(offset_n + n_local) * dim_k + k_local];
+  }
+  __syncthreads();
+
+  // [変更] __float2half が不要になり、half を直接ロード（2B/要素）
+  for (int k = 0; k < dim_k; k += 64) {
+    int cur = (k / 64) % 2;  // 今計算するバッファ（0 or 1）
+    int nxt = 1 - cur;        // 次にロードするバッファ（1 or 0）
+
+    // [案1] ロード: 次のタイルを buf[nxt] にロード
+    // buf[cur]（演算用）とは別バッファなので演算と並行して実行される
+    if (k + 64 < dim_k) {
+      for (int j = 0; j < 64; j++)
+        smem_a[nxt][j][tid] = d_a[(k + 64 + j) * dim_m + offset_m + tid];
+      for (int iter = 0; iter < 64; iter++) {
+        int flat    = iter * 128 + tid;
+        int n_local = flat / 64;
+        int k_local = flat % 64;
+        smem_b[nxt][n_local][k_local] = d_b[(offset_n + n_local) * dim_k + k + 64 + k_local];
+      }
     }
-    __syncthreads();
-    for (int kk = 0; kk < 32; kk += 16) {
+
+    // [案1] 演算: 現在のタイル buf[cur] で WMMA 演算
+    // [案2] kk は 0,16,32,48 の 4 回（K_step=64 のため）
+    for (int kk = 0; kk < 64; kk += 16) {
       for (int r = 0; r < 4; r++) {
         wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
-        wmma::load_matrix_sync(a_frag, &smem_a[kk][warp_m_idx * 64 + r * 16], 128);
+        wmma::load_matrix_sync(a_frag, &smem_a[cur][kk][warp_m_idx * 64 + r * 16], 128);
         for (int c = 0; c < 4; c++) {
           wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-          wmma::load_matrix_sync(b_frag, &smem_b[warp_n_idx * 64 + c * 16][kk], 32);
+          // [変更] K_step=64 に合わせて stride を 32→64
+          wmma::load_matrix_sync(b_frag, &smem_b[cur][warp_n_idx * 64 + c * 16][kk], 64);
           wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
         }
       }
     }
+    // buf[nxt] へのロード完了を全スレッドで待ってから次のイテレーションへ
+    __syncthreads();
   }
   for (int r = 0; r < 4; r++) {
     for (int c = 0; c < 4; c++) {
@@ -96,6 +121,11 @@ int main(int argc, const char **argv) {
   float_to_half<<<(m*k+255)/256, 256>>>(A, A_half, m*k);
   float_to_half<<<(k*n+255)/256, 256>>>(B, B_half, k*n);
   cudaDeviceSynchronize();
+
+  // [案1+2] shared memory 64KB を使うため最大構成を要求（H100 は最大 228KB 対応）
+  cudaFuncSetAttribute(kernel,
+    cudaFuncAttributePreferredSharedMemoryCarveout,
+    cudaSharedmemCarveoutMaxShared);
 
   cublasHandle_t cublas_handle;
   cublasCreate(&cublas_handle);
