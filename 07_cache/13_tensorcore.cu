@@ -75,22 +75,25 @@ void kernel(int dim_m, int dim_n, int dim_k,
 
   for (int k0 = 0; k0 < dim_k; k0 += BK) {
     // A/B は計測前に half 化済みなので、カーネル内の float->half 変換をなくす。
-    // 端の block で余った要素は 0 を入れ、入力範囲外を読まないようにする。
-    for (int idx = tid; idx < BK * BM; idx += blockDim.x) {
-      int kk = idx / BM;
-      int mm = idx - kk * BM;
-      int gm = base_m + mm;
-      int gk = k0 + kk;
-      smem_a[kk][mm] =
-          (gm < dim_m && gk < dim_k) ? d_a[gk * dim_m + gm] : __float2half(0.0f);
+    // [変更] 本番サイズは 128/256/32 のタイルで割り切れるため、境界分岐を外す。
+    // さらに half2 で 2 要素ずつ shared memory に運び、ロード命令数を減らす。
+    for (int idx = tid; idx < BK * (BM / 2); idx += blockDim.x) {
+      int kk = idx / (BM / 2);
+      int mm2 = idx - kk * (BM / 2);
+      int mm = mm2 * 2;
+      const half2 *src =
+          reinterpret_cast<const half2 *>(&d_a[(k0 + kk) * dim_m + base_m + mm]);
+      half2 *dst = reinterpret_cast<half2 *>(&smem_a[kk][mm]);
+      *dst = *src;
     }
-    for (int idx = tid; idx < BN * BK; idx += blockDim.x) {
-      int nn = idx / BK;
-      int kk = idx - nn * BK;
-      int gn = base_n + nn;
-      int gk = k0 + kk;
-      smem_b[nn][kk] =
-          (gn < dim_n && gk < dim_k) ? d_b[gn * dim_k + gk] : __float2half(0.0f);
+    for (int idx = tid; idx < BN * (BK / 2); idx += blockDim.x) {
+      int nn = idx / (BK / 2);
+      int kk2 = idx - nn * (BK / 2);
+      int kk = kk2 * 2;
+      const half2 *src =
+          reinterpret_cast<const half2 *>(&d_b[(base_n + nn) * dim_k + k0 + kk]);
+      half2 *dst = reinterpret_cast<half2 *>(&smem_b[nn][kk]);
+      *dst = *src;
     }
     __syncthreads();
 
@@ -125,11 +128,9 @@ void kernel(int dim_m, int dim_n, int dim_k,
     for (int c = 0; c < 4; ++c) {
       int c_m = base_m + warp_m * WM + r * 16;
       int c_n = base_n + warp_n * WN + c * 16;
-      // WMMA store は 16x16 単位なので、本番サイズは 16 の倍数を想定する。
-      if (c_m < dim_m && c_n < dim_n) {
-        wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c],
-                                dim_m, wmma::mem_col_major);
-      }
+      // 本番サイズは 16 の倍数なので store 側の境界分岐も外す。
+      wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c],
+                              dim_m, wmma::mem_col_major);
     }
   }
 }
@@ -147,6 +148,8 @@ int main(int argc, const char **argv) {
   float alpha = 1.0f;
   float beta = 0.0f;
   int Nt = 20;
+
+  std::printf("Kernel variant: 128x256 tile, 16 warps, padded smem, half2 load\n");
 
   float *A, *B, *C, *C2;
   CUDA_CHECK(cudaMallocManaged(&A, int64_t(m) * k * sizeof(float)));
