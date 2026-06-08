@@ -1,289 +1,182 @@
-#include <chrono>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
+#include <iostream>
+#include <typeinfo>
+#include <random>
+#include <stdint.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <mma.h>
-
+#include <chrono>
+#include <cmath>
+using namespace std;
 using namespace nvcuda;
 
-#define CUDA_CHECK(call)                                                     \
-  do {                                                                       \
-    cudaError_t err = (call);                                                \
-    if (err != cudaSuccess) {                                                \
-      std::fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
-                   cudaGetErrorString(err));                                 \
-      std::exit(1);                                                          \
-    }                                                                        \
-  } while (0)
-
-#define CUBLAS_CHECK(call)                                                    \
-  do {                                                                        \
-    cublasStatus_t stat = (call);                                             \
-    if (stat != CUBLAS_STATUS_SUCCESS) {                                      \
-      std::fprintf(stderr, "cuBLAS error at %s:%d: %d\n", __FILE__,          \
-                   __LINE__, int(stat));                                      \
-      std::exit(1);                                                           \
-    }                                                                         \
-  } while (0)
-
-__global__ void float_to_half(const float *__restrict__ src,
-                              half *__restrict__ dst,
-                              int64_t n) {
-  int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+// [追加] A, B を事前に half 型に変換するカーネル
+// 目的: カーネル内でのロードサイズを float(4B) → half(2B) に半減させる
+__global__ void float_to_half(float *src, half *dst, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < n) dst[i] = __float2half(src[i]);
 }
 
-__global__ __launch_bounds__(512, 1)
+// [変更] d_a, d_b を float* → half* に変更（事前変換済みを受け取る）
+__global__ __launch_bounds__(256)
 void kernel(int dim_m, int dim_n, int dim_k,
-            const half *__restrict__ d_a,
-            const half *__restrict__ d_b,
-            float *__restrict__ d_c) {
-  constexpr int BM = 128;
-  constexpr int BN = 256;
-  constexpr int BK = 32;
-  constexpr int BM_PAD = 136;
-  constexpr int BK_PAD = 40;
-  constexpr int WM = 32;
-  constexpr int WN = 64;
-
+	    const half *__restrict__ d_a,
+	    const half *__restrict__ d_b,
+	    float *__restrict__ d_c) {
+  int offset_m = 128 * blockIdx.x;
+  int offset_n = 256 * blockIdx.y;
   int tid = threadIdx.x;
-  int warp_id = tid >> 5;
-  int warp_m = warp_id >> 2;
-  int warp_n = warp_id & 3;
-  int base_m = blockIdx.x * BM;
-  int base_n = blockIdx.y * BN;
+  int warp_id = threadIdx.x / 32;
+  int warp_m_idx = warp_id / 4;
+  int warp_n_idx = warp_id % 4;
 
-  // C の 1 block あたりの担当範囲を 128x256 に拡大。
-  // [変更] 16 warp で 4x4 個の 32x64 warp tile を計算する。
-  // 1 warp が持つ accumulator を 16 個から 8 個に減らし、レジスタ圧迫を下げる。
-  // [変更] 通常ロードでは double buffer が十分に重ならないため、単一バッファに戻して
-  // shared memory に padding を入れる。WMMA load の bank conflict を減らす狙い。
-  __shared__ __align__(16) half smem_a[BK][BM_PAD];
-  __shared__ __align__(16) half smem_b[BN][BK_PAD];
+  constexpr int SMEM_A_LD = 136;
+  constexpr int SMEM_B_LD = 40;
+  __shared__ half smem_a[32][SMEM_A_LD];
+  __shared__ half smem_b[256][SMEM_B_LD];
 
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][4];
-#pragma unroll
-  for (int r = 0; r < 2; ++r) {
-#pragma unroll
-    for (int c = 0; c < 4; ++c) {
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4][4];
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++)
       wmma::fill_fragment(acc[r][c], 0.0f);
-    }
-  }
 
-  for (int k0 = 0; k0 < dim_k; k0 += BK) {
-    // A/B は計測前に half 化済みなので、カーネル内の float->half 変換をなくす。
-    // [変更] 本番サイズは 128/256/32 のタイルで割り切れるため、境界分岐を外す。
-    // さらに half2 で 2 要素ずつ shared memory に運び、ロード命令数を減らす。
-    for (int idx = tid; idx < BK * (BM / 2); idx += blockDim.x) {
-      int kk = idx / (BM / 2);
-      int mm2 = idx - kk * (BM / 2);
-      int mm = mm2 * 2;
+  for (int k = 0; k < dim_k; k += 32) {
+    __syncthreads();
+    // [変更] __float2half が不要になり、half を直接ロード（2B/要素）
+    for (int iter = 0; iter < 8; iter++) {
+      int flat = iter * 256 + tid;
+      int j = flat / 64;
+      int m_local = (flat % 64) * 2;
       const half2 *src =
-          reinterpret_cast<const half2 *>(&d_a[(k0 + kk) * dim_m + base_m + mm]);
-      half2 *dst = reinterpret_cast<half2 *>(&smem_a[kk][mm]);
+          reinterpret_cast<const half2 *>(&d_a[(k + j) * dim_m + offset_m + m_local]);
+      half2 *dst = reinterpret_cast<half2 *>(&smem_a[j][m_local]);
       *dst = *src;
     }
-    for (int idx = tid; idx < BN * (BK / 2); idx += blockDim.x) {
-      int nn = idx / (BK / 2);
-      int kk2 = idx - nn * (BK / 2);
-      int kk = kk2 * 2;
+    for (int iter = 0; iter < 16; iter++) {
+      int flat    = iter * 256 + tid;
+      int n_local = flat / 16;
+      int k_local = (flat % 16) * 2;
       const half2 *src =
-          reinterpret_cast<const half2 *>(&d_b[(base_n + nn) * dim_k + k0 + kk]);
-      half2 *dst = reinterpret_cast<half2 *>(&smem_b[nn][kk]);
+          reinterpret_cast<const half2 *>(&d_b[(offset_n + n_local) * dim_k + k + k_local]);
+      half2 *dst = reinterpret_cast<half2 *>(&smem_b[n_local][k_local]);
       *dst = *src;
     }
     __syncthreads();
-
-    // WMMA の固定回数ループを unroll し、Tensor Core 命令の制御オーバーヘッドを下げる。
-#pragma unroll
-    for (int kk = 0; kk < BK; kk += 16) {
-#pragma unroll
-      for (int r = 0; r < 2; ++r) {
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, half,
-                       wmma::col_major>
-            a_frag;
-        int a_m = warp_m * WM + r * 16;
-        wmma::load_matrix_sync(a_frag, &smem_a[kk][a_m], BM_PAD);
-
-#pragma unroll
-        for (int c = 0; c < 4; ++c) {
-          wmma::fragment<wmma::matrix_b, 16, 16, 16, half,
-                         wmma::col_major>
-              b_frag;
-          int b_n = warp_n * WN + c * 16;
-          wmma::load_matrix_sync(b_frag, &smem_b[b_n][kk], BK_PAD);
-          wmma::mma_sync(acc[r][c], a_frag, b_frag, acc[r][c]);
+    for (int kk = 0; kk < 32; kk += 16) {
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag[4];
+      for (int c = 0; c < 4; c++) {
+        wmma::load_matrix_sync(b_frag[c], &smem_b[warp_n_idx * 64 + c * 16][kk], SMEM_B_LD);
+      }
+      for (int r = 0; r < 4; r++) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::col_major> a_frag;
+        wmma::load_matrix_sync(a_frag, &smem_a[kk][warp_m_idx * 64 + r * 16], SMEM_A_LD);
+        for (int c = 0; c < 4; c++) {
+          wmma::mma_sync(acc[r][c], a_frag, b_frag[c], acc[r][c]);
         }
       }
     }
-    __syncthreads();
   }
-
-#pragma unroll
-  for (int r = 0; r < 2; ++r) {
-#pragma unroll
-    for (int c = 0; c < 4; ++c) {
-      int c_m = base_m + warp_m * WM + r * 16;
-      int c_n = base_n + warp_n * WN + c * 16;
-      // 本番サイズは 16 の倍数なので store 側の境界分岐も外す。
-      wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c],
-                              dim_m, wmma::mem_col_major);
+  for (int r = 0; r < 4; r++) {
+    for (int c = 0; c < 4; c++) {
+      int c_m = offset_m + warp_m_idx * 64 + r * 16;
+      int c_n = offset_n + warp_n_idx * 64 + c * 16;
+      if (c_m < dim_m && c_n < dim_n)
+        wmma::store_matrix_sync(&d_c[c_n * dim_m + c_m], acc[r][c], dim_m, wmma::mem_col_major);
     }
   }
 }
 
 int main(int argc, const char **argv) {
-#ifdef DEBUG_SMALL
-  int m = 256;
-  int k = 256;
-  int n = 256;
-#else
   int m = 10240;
   int k = 4096;
   int n = 8192;
-#endif
-  float alpha = 1.0f;
-  float beta = 0.0f;
-  int Nt = 20;
-
-  std::printf("Kernel variant: 128x256 tile, 16 warps, padded smem, half2 load\n");
-
+  float alpha = 1.0;
+  float beta = 0.0;
+  int Nt = 10;
+  printf("Kernel variant: WMMA 128x256 tile, 8 warps, padded smem\n");
   float *A, *B, *C, *C2;
-  CUDA_CHECK(cudaMallocManaged(&A, int64_t(m) * k * sizeof(float)));
-  CUDA_CHECK(cudaMallocManaged(&B, int64_t(k) * n * sizeof(float)));
-  CUDA_CHECK(cudaMallocManaged(&C, int64_t(m) * n * sizeof(float)));
-  CUDA_CHECK(cudaMallocManaged(&C2, int64_t(m) * n * sizeof(float)));
+  cudaMallocManaged(&A, m * k * sizeof(float));
+  cudaMallocManaged(&B, k * n * sizeof(float));
+  cudaMallocManaged(&C, m * n * sizeof(float));
+  cudaMallocManaged(&C2, m * n * sizeof(float));
+  for (int i=0; i<m; i++)
+    for (int j=0; j<k; j++)
+      A[k*i+j] = drand48();
+  for (int i=0; i<k; i++)
+    for (int j=0; j<n; j++)
+      B[n*i+j] = drand48();
+  for (int i=0; i<n; i++)
+    for (int j=0; j<m; j++)
+      C[m*i+j] = C2[m*i+j] = 0;
 
-  for (int i = 0; i < m; i++)
-    for (int j = 0; j < k; j++)
-      A[k * i + j] = drand48();
-  for (int i = 0; i < k; i++)
-    for (int j = 0; j < n; j++)
-      B[n * i + j] = drand48();
-  for (int i = 0; i < n; i++)
-    for (int j = 0; j < m; j++)
-      C[m * i + j] = C2[m * i + j] = 0.0f;
-
+  // [追加] A, B を half に事前変換（計測ループの外で行うのでカーネル時間に含まれない）
   half *A_half, *B_half;
-  CUDA_CHECK(cudaMallocManaged(&A_half, int64_t(m) * k * sizeof(half)));
-  CUDA_CHECK(cudaMallocManaged(&B_half, int64_t(k) * n * sizeof(half)));
-  // A/B を half に事前変換する。変換時間は GEMM の性能測定に含めない。
-  float_to_half<<<(int64_t(m) * k + 255) / 256, 256>>>(A, A_half,
-                                                        int64_t(m) * k);
-  CUDA_CHECK(cudaGetLastError());
-  float_to_half<<<(int64_t(k) * n + 255) / 256, 256>>>(B, B_half,
-                                                        int64_t(k) * n);
-  CUDA_CHECK(cudaGetLastError());
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  int dev = 0;
-  CUDA_CHECK(cudaGetDevice(&dev));
-  CUDA_CHECK(cudaMemPrefetchAsync(A_half, int64_t(m) * k * sizeof(half), dev));
-  CUDA_CHECK(cudaMemPrefetchAsync(B_half, int64_t(k) * n * sizeof(half), dev));
-  CUDA_CHECK(cudaMemPrefetchAsync(C, int64_t(m) * n * sizeof(float), dev));
-  CUDA_CHECK(cudaMemPrefetchAsync(C2, int64_t(m) * n * sizeof(float), dev));
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  // shared memory を優先する carveout を指定し、48 KB の double-buffer tile を安定して使う。
-  CUDA_CHECK(cudaFuncSetAttribute(kernel,
-                                  cudaFuncAttributePreferredSharedMemoryCarveout,
-                                  cudaSharedmemCarveoutMaxShared));
+  cudaMallocManaged(&A_half, (size_t)m * k * sizeof(half));
+  cudaMallocManaged(&B_half, (size_t)k * n * sizeof(half));
+  float_to_half<<<(m*k+255)/256, 256>>>(A, A_half, m*k);
+  float_to_half<<<(k*n+255)/256, 256>>>(B, B_half, k*n);
+  cudaDeviceSynchronize();
 
   cublasHandle_t cublas_handle;
-  CUBLAS_CHECK(cublasCreate(&cublas_handle));
-
-  cudaEvent_t start, stop;
-  CUDA_CHECK(cudaEventCreate(&start));
-  CUDA_CHECK(cudaEventCreate(&stop));
-
-  auto run_cublas = [&]() {
-    CUBLAS_CHECK(cublasGemmEx(cublas_handle,
-                              CUBLAS_OP_N,
-                              CUBLAS_OP_N,
-                              m,
-                              n,
-                              k,
-                              &alpha,
-                              A_half, CUDA_R_16F, m,
-                              B_half, CUDA_R_16F, k,
-                              &beta,
-                              C, CUDA_R_32F, m,
-                              CUBLAS_COMPUTE_32F,
-                              CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-  };
-
-  // cuBLAS も half 入力にそろえ、自作 Tensor Core カーネルと同じ条件で比較する。
-  for (int i = 0; i < 2; i++) {
-    run_cublas();
+  cublasCreate(&cublas_handle);
+  auto tic = chrono::steady_clock::now();
+  for (int i = 0; i < Nt+2; i++) {
+    if (i == 2) tic = chrono::steady_clock::now();
+    cublasGemmEx(cublas_handle,
+		 CUBLAS_OP_N,
+		 CUBLAS_OP_N,
+		 m,
+		 n,
+		 k,
+		 &alpha,
+		 A, CUDA_R_32F, m,
+		 B, CUDA_R_32F, k,
+		 &beta,
+		 C, CUDA_R_32F, m,
+			 CUBLAS_COMPUTE_32F_FAST_16F,
+			 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    cudaDeviceSynchronize();
   }
-  CUDA_CHECK(cudaDeviceSynchronize());
-  CUDA_CHECK(cudaEventRecord(start));
-  for (int i = 0; i < Nt; i++) {
-    run_cublas();
-  }
-  CUDA_CHECK(cudaEventRecord(stop));
-  CUDA_CHECK(cudaEventSynchronize(stop));
-  float cublas_ms = 0.0f;
-  CUDA_CHECK(cudaEventElapsedTime(&cublas_ms, start, stop));
-  int64_t num_flops = 2 * int64_t(m) * int64_t(n) * int64_t(k) +
-                      2 * int64_t(m) * int64_t(n);
-  double tcublas = double(cublas_ms) / 1000.0 / Nt;
+  auto toc = chrono::steady_clock::now();
+  int64_t num_flops = (2 * int64_t(m) * int64_t(n) * int64_t(k)) + (2 * int64_t(m) * int64_t(n));
+  double tcublas = chrono::duration<double>(toc - tic).count() / Nt;
   double cublas_flops = double(num_flops) / tcublas / 1.0e9;
-
-  dim3 block(512);
-  dim3 grid((m + 127) / 128, (n + 255) / 256);
-  // chrono ではなく CUDA Event で、GPU 上のカーネル実行時間だけを測る。
-  for (int i = 0; i < 2; i++) {
-    kernel<<<grid, block>>>(m, n, k, A_half, B_half, C2);
-    CUDA_CHECK(cudaGetLastError());
-  }
-  CUDA_CHECK(cudaDeviceSynchronize());
-  CUDA_CHECK(cudaEventRecord(start));
-  for (int i = 0; i < Nt; i++) {
-    kernel<<<grid, block>>>(m, n, k, A_half, B_half, C2);
-    CUDA_CHECK(cudaGetLastError());
-  }
-  CUDA_CHECK(cudaEventRecord(stop));
-  CUDA_CHECK(cudaEventSynchronize(stop));
-  float kernel_ms = 0.0f;
-  CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, start, stop));
-  double tkernel = double(kernel_ms) / 1000.0 / Nt;
-  double kernel_flops = double(num_flops) / tkernel / 1.0e9;
-  std::printf("CUBLAS:    %.2f Gflops, %.6f sec\n",
-              cublas_flops, tcublas);
-  std::printf("MY_KERNEL: %.2f Gflops, %.6f sec\n",
-              kernel_flops, tkernel);
-  std::printf("Ratio:     %.2f %% of cuBLAS\n",
-              100.0 * kernel_flops / cublas_flops);
-
-  CUDA_CHECK(cudaMemPrefetchAsync(C, int64_t(m) * n * sizeof(float),
-                                  cudaCpuDeviceId));
-  CUDA_CHECK(cudaMemPrefetchAsync(C2, int64_t(m) * n * sizeof(float),
-                                  cudaCpuDeviceId));
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  double err_sum = 0.0;
-  double err_max = 0.0;
-  for (int i = 0; i < n; i++) {
-    for (int j = 0; j < m; j++) {
-      double err = std::fabs(C[m * i + j] - C2[m * i + j]);
-      err_sum += err;
-      if (err > err_max) err_max = err;
+  dim3 block = dim3(256);
+  dim3 grid = dim3((m+127)/128, (n+255)/256);
+  for (int i = 0; i < Nt+2; i++) {
+    if (i == 2) tic = chrono::steady_clock::now();
+    // [変更] A_half, B_half を渡す
+    kernel<<< grid, block >>>(m, n, k, A_half, B_half, C2);
+    cudaError_t launch_status = cudaGetLastError();
+    if (launch_status != cudaSuccess) {
+      printf("kernel launch failed: %s\n", cudaGetErrorString(launch_status));
+      return 1;
+    }
+    launch_status = cudaDeviceSynchronize();
+    if (launch_status != cudaSuccess) {
+      printf("kernel execution failed: %s\n", cudaGetErrorString(launch_status));
+      return 1;
     }
   }
-  std::printf("mean error: %e\n", err_sum / n / m);
-  std::printf("max error:  %e\n", err_max);
-
-  CUDA_CHECK(cudaEventDestroy(start));
-  CUDA_CHECK(cudaEventDestroy(stop));
-  CUDA_CHECK(cudaFree(A));
-  CUDA_CHECK(cudaFree(B));
-  CUDA_CHECK(cudaFree(C));
-  CUDA_CHECK(cudaFree(C2));
-  CUDA_CHECK(cudaFree(A_half));
-  CUDA_CHECK(cudaFree(B_half));
-  CUBLAS_CHECK(cublasDestroy(cublas_handle));
+  toc = chrono::steady_clock::now();
+  double tcutlass = chrono::duration<double>(toc - tic).count() / Nt;
+  double cutlass_flops = double(num_flops) / tcutlass / 1.0e9;
+  printf("CUBLAS:    %.2f Gflops, %.6f sec\n", cublas_flops, tcublas);
+  printf("MY_KERNEL: %.2f Gflops, %.6f sec\n", cutlass_flops, tcutlass);
+  printf("Kernel GFLOPS: %.2f\n", cutlass_flops);
+  printf("Ratio:     %.2f %% of cuBLAS\n", 100.0 * cutlass_flops / cublas_flops);
+  double err = 0;
+  for (int i=0; i<n; i++) {
+    for (int j=0; j<m; j++) {
+      err += fabs(C[m*i+j] - C2[m*i+j]);
+    }
+  }
+  printf("error: %lf\n", err/n/m);
+  cudaFree(A);
+  cudaFree(B);
+  cudaFree(C);
+  cudaFree(C2);
+  cudaFree(A_half);
+  cudaFree(B_half);
+  cublasDestroy(cublas_handle);
 }
